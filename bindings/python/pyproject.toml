@@ -37,10 +37,11 @@ dev = ["tokenizers[testing]"]
 
 
 [build-system]
-requires = ["maturin>=1.0,<2.0"]
+requires = ["maturin==1.9.6"]
 build-backend = "maturin"
 
 [tool.maturin]
+locked = true
 python-source = "py_src"
 module-name = "tokenizers.tokenizers"
 bindings = "pyo3"

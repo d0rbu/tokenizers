@@ -1,6 +1,7 @@
 use ahash::{AHashMap, AHashSet};
 use std::sync::LazyLock;
 
+use crate::tokenizer::pattern::Pattern;
 use crate::utils::SysRegex;
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +48,88 @@ static RE: LazyLock<SysRegex> = LazyLock::new(|| {
 static BYTES_CHAR: LazyLock<AHashMap<u8, char>> = LazyLock::new(bytes_char);
 static CHAR_BYTES: LazyLock<AHashMap<char, u8>> =
     LazyLock::new(|| bytes_char().into_iter().map(|(c, b)| (b, c)).collect());
+
+// Only the fixed, unanchored GPT-2 expression above is specialized. Unknown
+// ASCII/Unicode boundaries use its original first match, including all lookahead.
+struct ByteLevelPattern<'a>(&'a SysRegex);
+
+#[derive(PartialEq)]
+enum AsciiClass {
+    Whitespace,
+    Letter,
+    Number,
+    Other,
+}
+
+fn ascii_class(byte: u8) -> Option<AsciiClass> {
+    match byte {
+        b'\t'..=b'\r' | b' ' => Some(AsciiClass::Whitespace),
+        b'A'..=b'Z' | b'a'..=b'z' => Some(AsciiClass::Letter),
+        b'0'..=b'9' => Some(AsciiClass::Number),
+        0..=0x7f => Some(AsciiClass::Other),
+        _ => None,
+    }
+}
+
+fn ascii_prefix_len(bytes: &[u8]) -> Option<usize> {
+    let first = *bytes.first()?;
+    if first == b'\'' {
+        const ENDINGS: [&[u8]; 7] = [b"'s", b"'t", b"'re", b"'ve", b"'m", b"'ll", b"'d"];
+        for ending in ENDINGS {
+            if bytes.starts_with(ending) {
+                return Some(ending.len());
+            }
+        }
+    }
+    let mut start = 0;
+    if first == b' '
+        && bytes
+            .get(1)
+            .and_then(|byte| ascii_class(*byte))
+            .is_some_and(|kind| kind != AsciiClass::Whitespace)
+    {
+        start = 1;
+    }
+    let kind = ascii_class(bytes[start])?;
+    let mut end = start + 1;
+    while let Some(byte) = bytes.get(end) {
+        let following = ascii_class(*byte)?;
+        if following != kind {
+            break;
+        }
+        end += 1;
+    }
+    // Before a nonspace, the first whitespace alternative backs up one byte.
+    if kind == AsciiClass::Whitespace && end < bytes.len() && end > start + 1 {
+        end -= 1;
+    }
+    Some(end)
+}
+
+impl Pattern for ByteLevelPattern<'_> {
+    fn find_matches(&self, inside: &str) -> Result<Vec<(crate::Offsets, bool)>> {
+        // fancy-regex stops at its backtracking limit on long valid strings.
+        // Preserve its original whole-input matching, including that behavior.
+        if !cfg!(feature = "onig") || inside.is_empty() {
+            return self.0.find_matches(inside);
+        }
+        let mut matches = Vec::with_capacity(inside.len());
+        let mut start = 0;
+        while start < inside.len() {
+            let remaining = &inside[start..];
+            let length = match ascii_prefix_len(remaining.as_bytes()) {
+                Some(length) => length,
+                None => match self.0.find_iter(remaining).next() {
+                    Some((0, end)) if end > 0 && remaining.is_char_boundary(end) => end,
+                    _ => return self.0.find_matches(inside),
+                },
+            };
+            matches.push(((start, start + length), true));
+            start += length;
+        }
+        Ok(matches)
+    }
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 /// Provides all the necessary steps to handle the BPE tokenization at the byte-level. Takes care
@@ -124,7 +207,7 @@ impl PreTokenizer for ByteLevel {
                 normalized.prepend(" ");
             }
             if self.use_regex {
-                normalized.split(re_ref, SplitDelimiterBehavior::Isolated)
+                normalized.split(ByteLevelPattern(re_ref), SplitDelimiterBehavior::Isolated)
             } else {
                 Ok(vec![normalized])
             }
@@ -241,6 +324,113 @@ mod tests {
         PreTokenizer,
     };
     use std::iter::FromIterator;
+
+    fn check_hybrid_pattern(text: &str) {
+        let original: &SysRegex = &RE;
+        assert_eq!(
+            ByteLevelPattern(original).find_matches(text).unwrap(),
+            original.find_matches(text).unwrap(),
+            "length={}, prefix={:?}",
+            text.len(),
+            text.chars().take(16).collect::<String>()
+        );
+    }
+
+    #[test]
+    fn hybrid_ascii_pattern_matches_original() {
+        for first in 0u8..=127 {
+            check_hybrid_pattern(&String::from_utf8(vec![first]).unwrap());
+            for second in 0u8..=127 {
+                check_hybrid_pattern(&String::from_utf8(vec![first, second]).unwrap());
+            }
+        }
+        let alphabet = b"ar0' \t\x0b!";
+        for length in 0..=6 {
+            for mut ordinal in 0..alphabet.len().pow(length) {
+                let mut text = String::with_capacity(length as usize);
+                for _ in 0..length {
+                    text.push(alphabet[ordinal % alphabet.len()] as char);
+                    ordinal /= alphabet.len();
+                }
+                check_hybrid_pattern(&text);
+            }
+        }
+    }
+
+    #[test]
+    fn hybrid_unicode_boundaries_match_original() {
+        let parts = [
+            "", "a", "0", "!", "'", "'s", "'t", "'re", "'ve", "'m", "'ll", "'d", "'S", " ", "\t",
+            "\n", "\r", "\x0b", "\x0c", "é", "中", "²", "Ⅷ", "\u{301}", "🙂", "\u{85}", "\u{a0}",
+            "\u{2003}", "\u{2028}", "\u{200d}", "\0",
+        ];
+        for head in parts {
+            for middle in parts {
+                for tail in parts {
+                    check_hybrid_pattern(&format!("{head}{middle}{tail}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hybrid_long_runs_match_original() {
+        for repeated in ["a", "0", "!", " ", "\t", "\x0b", "é", "🙂"] {
+            for length in [4096, 1_100_000] {
+                let run = repeated.repeat(length);
+                for end in ["", "a", " ", "\n", "é", "\u{301}", "🙂"] {
+                    check_hybrid_pattern(&format!("{run}{end}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bytelevel_preserves_long_regex_backend_behavior() {
+        let text = "a".repeat(1_100_000) + "!";
+        let original: &SysRegex = &RE;
+        for prefix in [false, true] {
+            let mut actual: PreTokenizedString = text.as_str().into();
+            ByteLevel::default()
+                .add_prefix_space(prefix)
+                .pre_tokenize(&mut actual)
+                .unwrap();
+            let mut expected: PreTokenizedString = text.as_str().into();
+            expected
+                .split(|_, mut normalized| {
+                    if prefix && !normalized.get().starts_with(' ') {
+                        normalized.prepend(" ");
+                    }
+                    normalized.split(original, SplitDelimiterBehavior::Isolated)
+                })
+                .unwrap();
+            ByteLevel::default()
+                .add_prefix_space(false)
+                .use_regex(false)
+                .pre_tokenize(&mut expected)
+                .unwrap();
+            for referential in [OffsetReferential::Original, OffsetReferential::Normalized] {
+                for offsets in [OffsetType::Byte, OffsetType::Char] {
+                    let observed: Vec<_> = actual
+                        .get_splits(referential, offsets)
+                        .into_iter()
+                        .map(|(text, offsets, _)| (text, offsets))
+                        .collect();
+                    let wanted: Vec<_> = expected
+                        .get_splits(referential, offsets)
+                        .into_iter()
+                        .map(|(text, offsets, _)| (text, offsets))
+                        .collect();
+                    assert!(
+                        observed == wanted,
+                        "prefix={prefix}, actual_splits={}, expected_splits={}",
+                        observed.len(),
+                        wanted.len()
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn pre_tokenization() {
