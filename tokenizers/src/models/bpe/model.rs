@@ -380,6 +380,10 @@ impl BPE {
     }
 
     fn merge_word(&self, w: &str) -> Result<Word> {
+        self.merge_word_impl(w, false)
+    }
+
+    fn merge_word_impl(&self, w: &str, proof: bool) -> Result<Word> {
         let mut indices = w.char_indices().map(|(idx, _)| idx).peekable();
         let mut word = Word::with_capacity(w.len());
         let mut unk: Option<(u32, usize)> = None;
@@ -461,7 +465,11 @@ impl BPE {
             word.add(unk_id, unk_len);
         }
 
-        word.merge_all(&self.merges, self.dropout);
+        if proof && self.dropout.is_none() {
+            word.merge_all_for_proof(&self.merges);
+        } else {
+            word.merge_all(&self.merges, self.dropout);
+        }
 
         Ok(word)
     }
@@ -503,7 +511,7 @@ impl BPE {
         if let Some(ref hit) = self.cache.as_ref().and_then(|c| c.get(sequence)) {
             return Ok(single_id(hit));
         }
-        let word = self.merge_word(sequence)?;
+        let word = self.merge_word_impl(sequence, true)?;
         let result = single_id(&word);
         if let Some(ref cache) = self.cache {
             if sequence.len() < MAX_LENGTH {
@@ -511,6 +519,127 @@ impl BPE {
             }
         }
         Ok(result)
+    }
+
+    /// Prove the serialized byte-alphabet merge family directly from this
+    /// immutable producer. The caller retains its live-vocabulary/configuration
+    /// admission. Word order, logical work limits and BPE/cache operations match
+    /// the serialized Python admission path.
+    pub fn proved_byte_ranks(
+        &self,
+        max_entries: usize,
+        max_word_chars: usize,
+        max_total_chars: usize,
+        mut remaining: usize,
+    ) -> Result<Option<Vec<(Vec<u8>, u32)>>> {
+        // Serialization is ordered by ID; repeated names retain the largest ID.
+        let mut vocab = AHashMap::<&str, u32>::with_capacity(self.vocab_r.len());
+        for (&id, word) in &self.vocab_r {
+            vocab
+                .entry(word.as_str())
+                .and_modify(|old| *old = (*old).max(id))
+                .or_insert(id);
+        }
+        if vocab.len() > max_entries
+            || self
+                .merges
+                .len()
+                .checked_add(256)
+                .is_none_or(|n| n > max_entries)
+        {
+            return Ok(None);
+        }
+        let mut alphabet = Vec::with_capacity(256);
+        let mut decoder = [0u8; 324];
+        let mut hidden = 256u32;
+        for byte in 0u32..256 {
+            let visible = (33..127).contains(&byte)
+                || (161..173).contains(&byte)
+                || (174..256).contains(&byte);
+            let point = if visible {
+                byte
+            } else {
+                let point = hidden;
+                hidden += 1;
+                point
+            };
+            decoder[point as usize] = byte as u8;
+            if visible {
+                alphabet.push(char::from_u32(point).unwrap());
+            }
+        }
+        alphabet.extend((256..hidden).map(|point| char::from_u32(point).unwrap()));
+        let mut ordered = Vec::with_capacity(self.merges.len() + 256);
+        let mut words = AHashMap::<&str, u32>::with_capacity(self.merges.len() + 256);
+        for character in alphabet {
+            let mut buffer = [0u8; 4];
+            let Some((&word, &id)) =
+                vocab.get_key_value(character.encode_utf8(&mut buffer) as &str)
+            else {
+                return Ok(None);
+            };
+            if id == u32::MAX {
+                return Ok(None);
+            }
+            words.insert(word, id);
+            ordered.push((word, id));
+        }
+        let mut merges = self.merges.iter().collect::<Vec<_>>();
+        merges.sort_unstable_by_key(|(_, (rank, _))| *rank);
+        let mut total = 256usize;
+        let mut previous = 0u32;
+        let mut combined = String::new();
+        for (&(left_id, right_id), _) in merges {
+            let left = self.vocab_r[&left_id].as_str();
+            let right = self.vocab_r[&right_id].as_str();
+            let Some(size) = left.chars().count().checked_add(right.chars().count()) else {
+                return Ok(None);
+            };
+            let Some(next) = total.checked_add(size) else {
+                return Ok(None);
+            };
+            total = next;
+            if size > max_word_chars || total > max_total_chars {
+                return Ok(None);
+            }
+            let (Some(&left_rank), Some(&right_rank)) = (words.get(left), words.get(right)) else {
+                return Ok(None);
+            };
+            combined.clear();
+            combined.push_str(left);
+            combined.push_str(right);
+            let Some((&word, &id)) = vocab.get_key_value(combined.as_str()) else {
+                return Ok(None);
+            };
+            if id == u32::MAX
+                || words.contains_key(word)
+                || id <= previous.max(left_rank).max(right_rank)
+            {
+                return Ok(None);
+            }
+            words.insert(word, id);
+            ordered.push((word, id));
+            previous = id;
+        }
+        for &(word, expected) in &ordered {
+            let length = word.chars().count();
+            let Some(cost) = length.checked_mul(length.saturating_sub(1)).map(|n| n / 2) else {
+                return Ok(None);
+            };
+            let Some(next) = remaining.checked_sub(cost) else {
+                return Ok(None);
+            };
+            remaining = next;
+            if self.tokenize_single_id(word)? != Some(expected) {
+                return Ok(None);
+            }
+        }
+        Ok(Some(
+            ordered
+                .into_iter()
+                .map(|(word, id)| (word.chars().map(|ch| decoder[ch as usize]).collect(), id))
+                .collect(),
+        ))
     }
 
     fn tokenize_with_cache(&self, sequence: &str) -> Result<Vec<Token>> {
@@ -1117,5 +1246,68 @@ mod tests {
                 }
             ]
         )
+    }
+}
+
+#[cfg(test)]
+mod native_byte_tables_tests {
+    use super::*;
+
+    fn model(merges: Merges) -> BPE {
+        let mut hidden = 256u32;
+        let mut vocab = Vocab::new();
+        for byte in 0u32..256 {
+            let point = if (33..127).contains(&byte)
+                || (161..173).contains(&byte)
+                || (174..256).contains(&byte)
+            {
+                byte
+            } else {
+                let p = hidden;
+                hidden += 1;
+                p
+            };
+            vocab.insert(char::from_u32(point).unwrap().to_string(), byte + 100);
+        }
+        for (index, (a, b)) in merges.iter().enumerate() {
+            vocab.insert(format!("{a}{b}"), 1000 + index as u32);
+        }
+        BPE::new(vocab, merges)
+    }
+
+    #[test]
+    fn byte_table_proof_preserves_boundaries_and_bytes() {
+        let bpe = model(vec![("a".into(), "b".into())]);
+        let rows = bpe.proved_byte_ranks(257, 2, 258, 1).unwrap().unwrap();
+        assert_eq!(rows.len(), 257);
+        let ranks = rows.into_iter().collect::<HashMap<_, _>>();
+        for byte in 0u32..256 {
+            assert_eq!(ranks[&vec![byte as u8]], byte + 100);
+        }
+        assert_eq!(ranks[&b"ab".to_vec()], 1000);
+        assert!(bpe.proved_byte_ranks(256, 2, 258, 1).unwrap().is_none());
+        assert!(bpe.proved_byte_ranks(257, 1, 258, 1).unwrap().is_none());
+        assert!(bpe.proved_byte_ranks(257, 2, 257, 1).unwrap().is_none());
+        assert!(bpe.proved_byte_ranks(257, 2, 258, 0).unwrap().is_none());
+    }
+
+    #[test]
+    fn byte_table_proof_checks_actual_reduction() {
+        let bpe = model(vec![
+            ("a".into(), "b".into()),
+            ("b".into(), "c".into()),
+            ("a".into(), "bc".into()),
+        ]);
+        assert!(bpe
+            .proved_byte_ranks(1000, 4096, 1 << 20, 1 << 20)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn byte_table_proof_counts_unicode_characters() {
+        let bpe = model(vec![("ñ".into(), "b".into())]);
+        let rows = bpe.proved_byte_ranks(257, 2, 258, 1).unwrap().unwrap();
+        assert_eq!(rows.last(), Some(&(vec![0xf1, b'b'], 1000)));
     }
 }

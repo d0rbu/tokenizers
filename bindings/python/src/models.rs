@@ -182,6 +182,46 @@ impl PyModel {
         Ok(true)
     }
 
+    /// Export proved ranks plus only the model-membership facts consumed by
+    /// added-token admission. No Python vocabulary/merge copies are constructed.
+    fn _native_packed_tables<'py>(
+        &self,
+        py: Python<'py>,
+        max_entries: usize,
+        max_word_chars: usize,
+        max_total_chars: usize,
+        remaining: usize,
+        added: &Bound<'py, PyList>,
+    ) -> PyResult<Option<(Bound<'py, PyBytes>, Bound<'py, PyDict>, Bound<'py, PySet>, Bound<'py, PySet>)>> {
+        let model = self.model.read().unwrap();
+        let ModelWrapper::BPE(bpe) = &*model else { return Ok(None); };
+        let Some(ranks) = ToPyResult(bpe.proved_byte_ranks(max_entries, max_word_chars, max_total_chars, remaining)).into_py()? else { return Ok(None); };
+        let used: std::collections::HashSet<u32> = ranks.iter().map(|(_, id)| *id).collect();
+        let mut output = Vec::with_capacity(ranks.iter().map(|(word, _)| 8 + word.len()).sum());
+        for (word, id) in ranks {
+            output.extend_from_slice(&id.to_le_bytes());
+            output.extend_from_slice(&(word.len() as u32).to_le_bytes());
+            output.extend_from_slice(&word);
+        }
+        let vocab = PyDict::new(py);
+        let model_ids = PySet::empty(py)?;
+        let collisions = PySet::empty(py)?;
+        for entry in added.iter() {
+            let content = entry.get_item("content")?;
+            let text = content.extract::<String>()?;
+            let added_id = entry.get_item("id")?.extract::<u32>()?;
+            if used.contains(&added_id) { collisions.add(added_id)?; }
+            if let Some(id) = bpe.token_to_id(&text) {
+                // Match the serializer's reverse map, including omitted aliases.
+                if bpe.id_to_token(id).as_deref() == Some(text.as_str()) {
+                    vocab.set_item(content, id)?;
+                }
+            }
+            if bpe.id_to_token(added_id).is_some() { model_ids.add(added_id)?; }
+        }
+        Ok(Some((PyBytes::new(py, &output), vocab, model_ids, collisions)))
+    }
+
     /// Get the ID associated to a token
     ///
     /// Args:

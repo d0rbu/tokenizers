@@ -738,6 +738,34 @@ impl PyTokenizer {
         ToPyResult(self.tokenizer.to_string(pretty)).into()
     }
 
+    /// Retain the complete serializer's byte bound and failure behavior, while
+    /// returning only the small metadata projection needed by native admission.
+    fn _native_admission_metadata(&self, max_bytes: usize) -> PyResult<Option<String>> {
+        struct Count(usize);
+        impl std::io::Write for Count {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self.0.saturating_add(bytes.len());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let mut count = Count(0);
+        ToPyResult(serde_json::to_writer(&mut count, &self.tokenizer).map_err(Into::into)).into_py()?;
+        if count.0 > max_bytes { return Ok(None); }
+        #[derive(Serialize)]
+        struct Metadata<'a> {
+            pre_tokenizer: Option<&'a PyPreTokenizer>,
+            post_processor: Option<&'a PyPostProcessor>,
+            added_tokens: &'a tk::tokenizer::AddedVocabulary,
+        }
+        let metadata = Metadata {
+            pre_tokenizer: self.tokenizer.get_pre_tokenizer(),
+            post_processor: self.tokenizer.get_post_processor(),
+            added_tokens: self.tokenizer.get_added_vocabulary(),
+        };
+        Ok(Some(ToPyResult(serde_json::to_string(&metadata).map_err(Into::into)).into_py()?))
+    }
+
     /// Save the :class:`~tokenizers.Tokenizer` to the file at the given path.
     ///
     /// Args:

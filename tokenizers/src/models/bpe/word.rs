@@ -4,7 +4,7 @@ use dary_heap::QuaternaryHeap;
 use rand::{rng, Rng};
 use std::cmp::Ordering;
 
-#[derive(Debug, Eq)]
+#[derive(Clone, Copy, Debug, Eq)]
 struct Merge {
     pos: usize,
     rank: u32,
@@ -249,6 +249,81 @@ impl Word {
         self.symbols.retain(|s| s.len != 0);
     }
 
+    /// Short deterministic proof words use the same rank/position queue entries
+    /// and stale-entry checks, with bounded inline storage instead of a heap.
+    pub(super) fn merge_all_for_proof(&mut self, merges: &AHashMap<Pair, (u32, u32)>) {
+        if self.symbols.len() > 32 {
+            self.merge_all(merges, None);
+            return;
+        }
+        // At most n-1 initial entries and one net new entry for each of n-1
+        // successful merges; stale pops only reduce occupancy. n <= 32.
+        let mut queue = [Merge {
+            pos: 0,
+            rank: 0,
+            new_id: 0,
+        }; 64];
+        let mut len = 0;
+        for (pos, pair) in self.symbols.windows(2).enumerate() {
+            if let Some(&(rank, new_id)) = merges.get(&(pair[0].c, pair[1].c)) {
+                queue[len] = Merge { pos, rank, new_id };
+                len += 1;
+            }
+        }
+        while len != 0 {
+            let mut best = 0;
+            for i in 1..len {
+                if queue[i] > queue[best] {
+                    best = i;
+                }
+            }
+            let top = queue[best];
+            len -= 1;
+            queue[best] = queue[len];
+            if self.symbols[top.pos].len == 0 || self.symbols[top.pos].next == -1 {
+                continue;
+            }
+            let next_pos = self.symbols[top.pos].next as usize;
+            let right = self.symbols[next_pos];
+            let target_new_pair = (self.symbols[top.pos].c, right.c);
+            if merges
+                .get(&target_new_pair)
+                .is_none_or(|(_, new_id)| *new_id != top.new_id)
+            {
+                continue;
+            }
+            self.symbols[top.pos].merge_with(&right, top.new_id);
+            self.symbols[next_pos].len = 0;
+            if right.next > -1 && (right.next as usize) < self.symbols.len() {
+                self.symbols[right.next as usize].prev = top.pos as isize;
+            }
+            let current = self.symbols[top.pos];
+            if current.prev >= 0 {
+                let prev = current.prev as usize;
+                if let Some(&(rank, new_id)) = merges.get(&(self.symbols[prev].c, current.c)) {
+                    queue[len] = Merge {
+                        pos: prev,
+                        rank,
+                        new_id,
+                    };
+                    len += 1;
+                }
+            }
+            let next = current.next as usize;
+            if next < self.symbols.len() {
+                if let Some(&(rank, new_id)) = merges.get(&(current.c, self.symbols[next].c)) {
+                    queue[len] = Merge {
+                        pos: top.pos,
+                        rank,
+                        new_id,
+                    };
+                    len += 1;
+                }
+            }
+        }
+        self.symbols.retain(|s| s.len != 0);
+    }
+
     pub(super) fn get_chars(&self) -> Vec<u32> {
         self.symbols.iter().map(|s| s.c).collect()
     }
@@ -271,6 +346,44 @@ impl Word {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proof_inline_queue_matches_heap() {
+        let mut state = 0x709a_1324_e56c_8bd1u64;
+        let mut random = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for trial in 0..4096 {
+            let mut merges = AHashMap::new();
+            for left in 0..24 {
+                for right in 0..24 {
+                    let value = random();
+                    if value % 5 == 0 {
+                        merges.insert(
+                            (left, right),
+                            ((value % 127) as u32, ((value >> 8) % 24) as u32),
+                        );
+                    }
+                }
+            }
+            let mut expected = Word::new();
+            for _ in 0..trial % 66 {
+                expected.add((random() % 24) as u32, (1 + random() % 4) as usize);
+            }
+            let mut actual = expected.clone();
+            expected.merge_all(&merges, None);
+            actual.merge_all_for_proof(&merges);
+            assert_eq!(actual.get_chars(), expected.get_chars(), "trial {trial}");
+            assert_eq!(
+                actual.get_offsets_iter().collect::<Vec<_>>(),
+                expected.get_offsets_iter().collect::<Vec<_>>(),
+                "trial {trial}"
+            );
+        }
+    }
 
     #[test]
     fn test_merge() {
