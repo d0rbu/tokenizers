@@ -472,6 +472,47 @@ impl BPE {
             .map(move |(id, offsets)| Token::new(id, self.vocab_r[&id].clone(), offsets))
     }
 
+    /// Return the sole ID, if any, with the same deterministic BPE/cache operations.
+    /// This avoids materializing token strings and offsets for model proofs.
+    pub fn tokenize_single_id(&self, sequence: &str) -> Result<Option<u32>> {
+        fn single_id(word: &Word) -> Option<u32> {
+            let mut ids = word.get_chars_iter();
+            let first = ids.next()?;
+            if ids.next().is_none() {
+                Some(first)
+            } else {
+                None
+            }
+        }
+        if sequence.is_empty() {
+            return Ok(None);
+        }
+        if self.dropout.is_some_and(|value| value != 0.0) {
+            let tokens = self.tokenize(sequence)?;
+            return Ok(if tokens.len() == 1 {
+                Some(tokens[0].id)
+            } else {
+                None
+            });
+        }
+        if self.ignore_merges {
+            if let Some(id) = self.vocab.get(sequence) {
+                return Ok(Some(*id));
+            }
+        }
+        if let Some(ref hit) = self.cache.as_ref().and_then(|c| c.get(sequence)) {
+            return Ok(single_id(hit));
+        }
+        let word = self.merge_word(sequence)?;
+        let result = single_id(&word);
+        if let Some(ref cache) = self.cache {
+            if sequence.len() < MAX_LENGTH {
+                cache.set(sequence.to_owned(), word);
+            }
+        }
+        Ok(result)
+    }
+
     fn tokenize_with_cache(&self, sequence: &str) -> Result<Vec<Token>> {
         if self.ignore_merges {
             if let Some(id) = self.vocab.get(sequence) {
@@ -581,6 +622,77 @@ impl Model for BPE {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+
+    fn check_single_ids(model: BPE, inputs: &[&str]) {
+        let other = model.clone();
+        for _ in 0..2 {
+            for input in inputs {
+                let tokens = model.tokenize(input).unwrap();
+                let expected = if tokens.len() == 1 {
+                    Some(tokens[0].id)
+                } else {
+                    None
+                };
+                assert_eq!(other.tokenize_single_id(input).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn single_id_preserves_empty_multiple_and_cached_results() {
+        let vocab: Vocab = [("a".into(), 0), ("b".into(), 1), ("ab".into(), 2)]
+            .iter()
+            .cloned()
+            .collect();
+        let model = BPE::builder()
+            .vocab_and_merges(vocab, vec![("a".into(), "b".into())])
+            .build()
+            .unwrap();
+        check_single_ids(model, &["", "a", "ab", "aba", "unknown", "baba"]);
+    }
+
+    #[test]
+    fn single_id_preserves_ignore_merges_and_zero_dropout() {
+        for ignore in [false, true] {
+            let vocab: Vocab = [("a".into(), 0), ("b".into(), 1), ("ab".into(), 2)]
+                .iter()
+                .cloned()
+                .collect();
+            let model = BPE::builder()
+                .vocab_and_merges(vocab, vec![])
+                .ignore_merges(ignore)
+                .dropout(0.0)
+                .build()
+                .unwrap();
+            check_single_ids(model, &["", "a", "ab", "aba", "unknown"]);
+        }
+    }
+
+    #[test]
+    fn single_id_preserves_unknown_fusion() {
+        for fuse in [false, true] {
+            let vocab: Vocab = [("a".into(), 0), ("<unk>".into(), 1)]
+                .iter()
+                .cloned()
+                .collect();
+            let model = BPE::builder()
+                .vocab_and_merges(vocab, vec![])
+                .unk_token("<unk>".into())
+                .fuse_unk(fuse)
+                .build()
+                .unwrap();
+            check_single_ids(model, &["", "a", "z", "zz", "az", "🙂"]);
+        }
+    }
+
+    #[test]
+    fn single_id_preserves_missing_unknown_error() {
+        let model = BPE::builder().unk_token("<unk>".into()).build().unwrap();
+        assert_eq!(
+            model.tokenize("z").unwrap_err().to_string(),
+            model.tokenize_single_id("z").unwrap_err().to_string()
+        );
+    }
 
     #[test]
     fn test_ordered_vocab_iter() {
