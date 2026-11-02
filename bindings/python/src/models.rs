@@ -137,6 +137,51 @@ impl PyModel {
             .collect())
     }
 
+    /// Prove singleton IDs in insertion order without creating Python tokens.
+    /// The caller owns an immutable model and the admitted vocabulary words.
+    fn _prove_model_words(
+        &self,
+        py: Python<'_>,
+        words: &Bound<'_, PyDict>,
+        mut remaining: u64,
+    ) -> PyResult<bool> {
+        for (word, expected) in words.iter() {
+            let length = word.len()? as u64;
+            let Some(cost) = length.checked_mul(length.saturating_sub(1)).map(|n| n / 2) else {
+                return Ok(false);
+            };
+            let Some(next) = remaining.checked_sub(cost) else {
+                return Ok(false);
+            };
+            remaining = next;
+            let text = word.downcast::<PyString>()?.to_cow()?;
+            // Release the model guard before Python equality, as tokenize does.
+            let id = {
+                let model = self.model.read().unwrap();
+                match &*model {
+                    ModelWrapper::BPE(bpe) => {
+                        ToPyResult(bpe.tokenize_single_id(&text)).into_py()?
+                    }
+                    _ => {
+                        let tokens = ToPyResult(model.tokenize(&text)).into_py()?;
+                        if tokens.len() == 1 {
+                            Some(tokens[0].id)
+                        } else {
+                            None
+                        }
+                    }
+                }
+            };
+            let Some(id) = id else {
+                return Ok(false);
+            };
+            if id.into_pyobject(py)?.as_any().ne(&expected)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Get the ID associated to a token
     ///
     /// Args:

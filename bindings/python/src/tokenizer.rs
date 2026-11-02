@@ -1,5 +1,5 @@
 use serde::Serialize;
-use std::collections::{hash_map::DefaultHasher, HashMap};
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use numpy::{npyffi, PyArray1, PyArrayMethods};
@@ -10,6 +10,7 @@ use pyo3::types::*;
 use pyo3::IntoPyObject;
 use pyo3::{exceptions, IntoPyObjectExt};
 use tk::models::bpe::BPE;
+use tk::models::ModelWrapper;
 use tk::tokenizer::{
     Model, PaddingDirection, PaddingParams, PaddingStrategy, PostProcessor, TokenizerImpl,
     TruncationDirection, TruncationParams, TruncationStrategy,
@@ -785,6 +786,35 @@ impl PyTokenizer {
         self.tokenizer.get_vocab(with_added_tokens)
     }
 
+    /// Bound the immutable producer vocabulary without Python entry copies.
+    fn _bounded_model_vocab(
+        &self,
+        max_entries: u32,
+        max_word_chars: usize,
+        max_total_bytes: usize,
+    ) -> bool {
+        let vocab = self.tokenizer.get_vocab(true);
+        let mut seen = HashSet::with_capacity(vocab.len());
+        let mut total = 0usize;
+        for (word, id) in vocab {
+            if word.chars().count() > max_word_chars
+                || id == u32::MAX
+                || id >= max_entries
+                || !seen.insert(id)
+            {
+                return false;
+            }
+            let Some(next) = total.checked_add(word.len()) else {
+                return false;
+            };
+            total = next;
+            if total > max_total_bytes {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Get the underlying vocabulary
     ///
     /// Returns:
@@ -812,6 +842,21 @@ impl PyTokenizer {
     #[pyo3(signature = (with_added_tokens = true))]
     #[pyo3(text_signature = "(self, with_added_tokens=True)")]
     fn get_vocab_size(&self, with_added_tokens: bool) -> usize {
+        if with_added_tokens {
+            let model = self.tokenizer.get_model().model.read().unwrap();
+            if let ModelWrapper::BPE(bpe) = &*model {
+                // BPE stores a map of unique spellings. Other models can retain
+                // duplicate vocabulary entries, so keep their original path.
+                return bpe.get_vocab_size()
+                    + self
+                        .tokenizer
+                        .get_added_vocabulary()
+                        .get_vocab()
+                        .keys()
+                        .filter(|token| bpe.token_to_id(token).is_none())
+                        .count();
+            }
+        }
         self.tokenizer.get_vocab_size(with_added_tokens)
     }
 
