@@ -533,7 +533,9 @@ impl BPE {
         let result = single_id(word);
         if let Some(ref cache) = self.cache {
             if sequence.len() < MAX_LENGTH {
-                cache.set_values(std::iter::once_with(|| (sequence.to_owned(), word.clone())));
+                cache.set_values(std::iter::once_with(|| {
+                    (sequence.to_owned(), std::mem::take(word))
+                }));
             }
         }
         Ok(result)
