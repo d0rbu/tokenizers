@@ -85,6 +85,11 @@ impl Word {
         }
     }
 
+    pub(super) fn reset(&mut self, capacity: usize) {
+        self.symbols.clear();
+        self.symbols.reserve(capacity);
+    }
+
     pub(super) fn add(&mut self, c: u32, byte_len: usize) {
         let (prev, next) = {
             let len = self.symbols.len() as isize;

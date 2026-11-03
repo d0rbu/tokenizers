@@ -384,8 +384,14 @@ impl BPE {
     }
 
     fn merge_word_impl(&self, w: &str, proof: bool) -> Result<Word> {
-        let mut indices = w.char_indices().map(|(idx, _)| idx).peekable();
         let mut word = Word::with_capacity(w.len());
+        self.merge_word_into(w, proof, &mut word)?;
+        Ok(word)
+    }
+
+    fn merge_word_into(&self, w: &str, proof: bool, word: &mut Word) -> Result<()> {
+        word.reset(w.len());
+        let mut indices = w.char_indices().map(|(idx, _)| idx).peekable();
         let mut unk: Option<(u32, usize)> = None;
         while let Some(i) = indices.next() {
             let end = indices.peek();
@@ -475,7 +481,7 @@ impl BPE {
             word.merge_all(&self.merges, self.dropout);
         }
 
-        Ok(word)
+        Ok(())
     }
 
     fn word_to_tokens<'a>(&'a self, word: &'a Word) -> impl Iterator<Item = Token> + 'a {
@@ -487,6 +493,14 @@ impl BPE {
     /// Return the sole ID, if any, with the same deterministic BPE/cache operations.
     /// This avoids materializing token strings and offsets for model proofs.
     pub fn tokenize_single_id(&self, sequence: &str) -> Result<Option<u32>> {
+        self.tokenize_single_id_with_buffer(sequence, &mut Word::new())
+    }
+
+    fn tokenize_single_id_with_buffer(
+        &self,
+        sequence: &str,
+        word: &mut Word,
+    ) -> Result<Option<u32>> {
         fn single_id(word: &Word) -> Option<u32> {
             let mut ids = word.get_chars_iter();
             let first = ids.next()?;
@@ -515,11 +529,11 @@ impl BPE {
         if let Some(ref hit) = self.cache.as_ref().and_then(|c| c.get(sequence)) {
             return Ok(single_id(hit));
         }
-        let word = self.merge_word_impl(sequence, true)?;
-        let result = single_id(&word);
+        self.merge_word_into(sequence, true, word)?;
+        let result = single_id(word);
         if let Some(ref cache) = self.cache {
             if sequence.len() < MAX_LENGTH {
-                cache.set(sequence.to_owned(), word);
+                cache.set_values(std::iter::once_with(|| (sequence.to_owned(), word.clone())));
             }
         }
         Ok(result)
@@ -625,6 +639,7 @@ impl BPE {
             ordered.push((word, id));
             previous = id;
         }
+        let mut scratch = Word::new();
         for &(word, expected) in &ordered {
             let length = word.chars().count();
             let Some(cost) = length.checked_mul(length.saturating_sub(1)).map(|n| n / 2) else {
@@ -634,7 +649,7 @@ impl BPE {
                 return Ok(None);
             };
             remaining = next;
-            if self.tokenize_single_id(word)? != Some(expected) {
+            if self.tokenize_single_id_with_buffer(word, &mut scratch)? != Some(expected) {
                 return Ok(None);
             }
         }
@@ -825,6 +840,92 @@ mod tests {
             model.tokenize("z").unwrap_err().to_string(),
             model.tokenize_single_id("z").unwrap_err().to_string()
         );
+    }
+
+    #[test]
+    fn reused_proof_buffer_preserves_tokens_offsets_and_cache_admission() {
+        for capacity in [0, 2, 100] {
+            for dropout in [None, Some(0.0)] {
+                for ignore in [false, true] {
+                    let vocab: Vocab = [("a".into(), 0), ("b".into(), 1), ("ab".into(), 2)]
+                        .iter()
+                        .cloned()
+                        .collect();
+                    let mut reference = BPE::builder()
+                        .vocab_and_merges(vocab, vec![("a".into(), "b".into())])
+                        .cache_capacity(capacity)
+                        .ignore_merges(ignore)
+                        .build()
+                        .unwrap();
+                    reference.dropout = dropout;
+                    let actual = reference.clone();
+                    let long = "aba".repeat(MAX_LENGTH);
+                    let inputs = ["ab", "aba", "a", "", "unknown", &long, "b", "ab"];
+                    let mut scratch = Word::new();
+                    for _ in 0..2 {
+                        for input in inputs {
+                            let tokens = reference.tokenize(input).unwrap();
+                            let expected = (tokens.len() == 1).then(|| tokens[0].id);
+                            assert_eq!(
+                                actual
+                                    .tokenize_single_id_with_buffer(input, &mut scratch)
+                                    .unwrap(),
+                                expected
+                            );
+                        }
+                    }
+                    for input in inputs {
+                        let cached = |bpe: &BPE| {
+                            bpe.cache
+                                .as_ref()
+                                .and_then(|cache| cache.get(input))
+                                .map(|word| bpe.word_to_tokens(&word).collect::<Vec<_>>())
+                        };
+                        assert_eq!(cached(&actual), cached(&reference));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reused_proof_buffer_recovers_after_unknown_errors_and_fallback() {
+        for fallback in [false, true] {
+            for fuse in [false, true] {
+                for valid_unknown in [false, true] {
+                    let mut vocab: Vocab =
+                        [("a".into(), 0), ("<0xC3>".into(), 1), ("<0xA9>".into(), 2)]
+                            .iter()
+                            .cloned()
+                            .collect();
+                    if valid_unknown {
+                        vocab.insert("[UNK]".into(), 3);
+                    }
+                    let bpe = BPE::builder()
+                        .vocab_and_merges(vocab, vec![])
+                        .cache_capacity(0)
+                        .byte_fallback(fallback)
+                        .fuse_unk(fuse)
+                        .unk_token("[UNK]".into())
+                        .build()
+                        .unwrap();
+                    let mut scratch = Word::new();
+                    for input in ["a中", "a", "é", "", "é中🦀", "aaaa", "a"] {
+                        let reference = bpe.tokenize(input);
+                        let actual = bpe.tokenize_single_id_with_buffer(input, &mut scratch);
+                        match (reference, actual) {
+                            (Ok(tokens), Ok(id)) => {
+                                assert_eq!(id, (tokens.len() == 1).then(|| tokens[0].id));
+                            }
+                            (Err(left), Err(right)) => {
+                                assert_eq!(left.to_string(), right.to_string());
+                            }
+                            other => panic!("reused proof buffer changed result: {:?}", other),
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
