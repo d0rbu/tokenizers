@@ -1351,7 +1351,7 @@ mod native_byte_tables_tests {
             for fuse_unk in [false, true] {
                 for valid_unk in [false, true] {
                     let mut vocab: Vocab =
-                        [("a".into(), 0), ("<0xC3>".into(), 1), ("<0xA9>".into(), 2)]
+                        vec![("a".into(), 0), ("<0xC3>".into(), 1), ("<0xA9>".into(), 2)]
                             .into_iter()
                             .collect();
                     if valid_unk {
