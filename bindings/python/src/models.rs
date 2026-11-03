@@ -195,14 +195,7 @@ impl PyModel {
     ) -> PyResult<Option<(Bound<'py, PyBytes>, Bound<'py, PyDict>, Bound<'py, PySet>, Bound<'py, PySet>)>> {
         let model = self.model.read().unwrap();
         let ModelWrapper::BPE(bpe) = &*model else { return Ok(None); };
-        let Some(ranks) = ToPyResult(bpe.proved_byte_ranks(max_entries, max_word_chars, max_total_chars, remaining)).into_py()? else { return Ok(None); };
-        let used: std::collections::HashSet<u32> = ranks.iter().map(|(_, id)| *id).collect();
-        let mut output = Vec::with_capacity(ranks.iter().map(|(word, _)| 8 + word.len()).sum());
-        for (word, id) in ranks {
-            output.extend_from_slice(&id.to_le_bytes());
-            output.extend_from_slice(&(word.len() as u32).to_le_bytes());
-            output.extend_from_slice(&word);
-        }
+        let Some((output, used)) = ToPyResult(bpe.proved_packed_byte_ranks(max_entries, max_word_chars, max_total_chars, remaining)).into_py()? else { return Ok(None); };
         let vocab = PyDict::new(py);
         let model_ids = PySet::empty(py)?;
         let collisions = PySet::empty(py)?;

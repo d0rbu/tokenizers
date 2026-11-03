@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import struct
 from typing import Any
 
 import pytest
@@ -106,3 +107,45 @@ def test_surrogate_failure_and_quota_order(word: str) -> None:
         failures.append((exc.value.encoding, exc.value.object, exc.value.start, exc.value.end, exc.value.reason))
     assert failures[0] == failures[1]
     assert not model()._prove_model_words({"a\ud800": 0}, 0)
+
+
+def packed_model() -> tuple[BPE, bytes]:
+    visible = [*range(33, 127), *range(161, 173), *range(174, 256)]
+    hidden = [byte for byte in range(256) if byte not in visible]
+    symbols = {byte: chr(byte) for byte in visible}
+    symbols.update({byte: chr(256 + index) for index, byte in enumerate(hidden)})
+    vocab = {symbols[byte]: byte for byte in range(256)}
+    vocab.update({"ab": 256, "aba": 257, "special": 258})
+    m = BPE(vocab, [("a", "b"), ("ab", "a")])
+    rows = [(byte, bytes([byte])) for byte in visible + hidden]
+    rows += [(256, b"ab"), (257, b"aba")]
+    return m, b"".join(struct.pack("<II", ordinal, len(word)) + word for ordinal, word in rows)
+
+
+def test_packed_table_bytes_and_added_membership() -> None:
+    m, expected = packed_model()
+    entries = [{"content": "ab", "id": 256}, {"content": "special", "id": 258}, {"content": "new", "id": 999}]
+    assert m._native_packed_tables(259, 3, 261, 4, entries) == (
+        expected,
+        {"ab": 256, "special": 258},
+        {256, 258},
+        {256},
+    )
+
+
+@pytest.mark.parametrize(
+    "limits,accepted",
+    [
+        ((259, 3, 261, 4), True),
+        ((258, 3, 261, 4), False),
+        ((259, 2, 261, 4), False),
+        ((259, 3, 260, 4), False),
+        ((259, 3, 261, 3), False),
+    ],
+)
+def test_packed_table_limits(limits: tuple[int, int, int, int], accepted: bool) -> None:
+    m, expected = packed_model()
+    result = m._native_packed_tables(*limits, [])
+    assert (result is not None) == accepted
+    if result is not None:
+        assert result == (expected, {}, set(), set())

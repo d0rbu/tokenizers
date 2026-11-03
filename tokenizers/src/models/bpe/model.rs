@@ -550,8 +550,60 @@ impl BPE {
         max_entries: usize,
         max_word_chars: usize,
         max_total_chars: usize,
-        mut remaining: usize,
+        remaining: usize,
     ) -> Result<Option<Vec<(Vec<u8>, u32)>>> {
+        self.map_proved_byte_words(
+            max_entries,
+            max_word_chars,
+            max_total_chars,
+            remaining,
+            |ordered, decoder, _| {
+                ordered
+                    .into_iter()
+                    .map(|(word, id)| (word.chars().map(|ch| decoder[ch as usize]).collect(), id))
+                    .collect()
+            },
+        )
+    }
+
+    /// Export the same proved table directly to its packed transport, without
+    /// allocating and copying a byte vector for every vocabulary word.
+    pub fn proved_packed_byte_ranks(
+        &self,
+        max_entries: usize,
+        max_word_chars: usize,
+        max_total_chars: usize,
+        remaining: usize,
+    ) -> Result<Option<(Vec<u8>, std::collections::HashSet<u32>)>> {
+        self.map_proved_byte_words(
+            max_entries,
+            max_word_chars,
+            max_total_chars,
+            remaining,
+            |ordered, decoder, total| {
+                let used = ordered.iter().map(|(_, id)| *id).collect();
+                let mut output = Vec::with_capacity(8 * ordered.len() + total);
+                for (word, id) in ordered {
+                    output.extend_from_slice(&id.to_le_bytes());
+                    let length_offset = output.len();
+                    output.extend_from_slice(&[0; 4]);
+                    output.extend(word.chars().map(|ch| decoder[ch as usize]));
+                    let length = (output.len() - length_offset - 4) as u32;
+                    output[length_offset..length_offset + 4].copy_from_slice(&length.to_le_bytes());
+                }
+                (output, used)
+            },
+        )
+    }
+
+    fn map_proved_byte_words<T>(
+        &self,
+        max_entries: usize,
+        max_word_chars: usize,
+        max_total_chars: usize,
+        mut remaining: usize,
+        finish: impl FnOnce(Vec<(&str, u32)>, [u8; 324], usize) -> T,
+    ) -> Result<Option<T>> {
         // Serialization is ordered by ID; repeated names retain the largest ID.
         let mut vocab = AHashMap::<&str, u32>::with_capacity(self.vocab_r.len());
         for (&id, word) in &self.vocab_r {
@@ -655,12 +707,7 @@ impl BPE {
                 return Ok(None);
             }
         }
-        Ok(Some(
-            ordered
-                .into_iter()
-                .map(|(word, id)| (word.chars().map(|ch| decoder[ch as usize]).collect(), id))
-                .collect(),
-        ))
+        Ok(Some(finish(ordered, decoder, total)))
     }
 
     fn tokenize_with_cache(&self, sequence: &str) -> Result<Vec<Token>> {
@@ -1416,6 +1463,61 @@ mod native_byte_tables_tests {
         let bpe = model(vec![("ñ".into(), "b".into())]);
         let rows = bpe.proved_byte_ranks(257, 2, 258, 1).unwrap().unwrap();
         assert_eq!(rows.last(), Some(&(vec![0xf1, b'b'], 1000)));
+    }
+
+    #[test]
+    fn packed_proof_matches_all_byte_rows_order_and_limits() {
+        for capacity in [0, 2, 10_000] {
+            let mut bpe = model(vec![
+                ("a".into(), "b".into()),
+                ("ab".into(), "c".into()),
+                ("ñ".into(), "b".into()),
+            ]);
+            bpe.resize_cache(capacity);
+            for (entries, word_chars, total_chars, quota) in [
+                (259, 3, 263, 5),
+                (258, 3, 263, 5),
+                (259, 2, 263, 5),
+                (259, 3, 262, 5),
+                (259, 3, 263, 4),
+            ] {
+                let reference = bpe
+                    .clone()
+                    .proved_byte_ranks(entries, word_chars, total_chars, quota)
+                    .unwrap();
+                let packed = bpe
+                    .clone()
+                    .proved_packed_byte_ranks(entries, word_chars, total_chars, quota)
+                    .unwrap();
+                let expected = reference.map(|rows| {
+                    let used = rows.iter().map(|(_, id)| *id).collect();
+                    let mut bytes = Vec::new();
+                    for (word, id) in rows {
+                        bytes.extend_from_slice(&id.to_le_bytes());
+                        bytes.extend_from_slice(&(word.len() as u32).to_le_bytes());
+                        bytes.extend_from_slice(&word);
+                    }
+                    (bytes, used)
+                });
+                assert_eq!(packed, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn packed_proof_preserves_errors() {
+        let mut bpe = model(vec![("a".into(), "b".into())]);
+        bpe.continuing_subword_prefix = Some("##".into());
+        bpe.unk_token = Some("missing".into());
+        assert_eq!(
+            bpe.clone()
+                .proved_byte_ranks(1000, 4096, 1 << 20, 1 << 20)
+                .unwrap_err()
+                .to_string(),
+            bpe.proved_packed_byte_ranks(1000, 4096, 1 << 20, 1 << 20)
+                .unwrap_err()
+                .to_string()
+        );
     }
 
     #[test]
