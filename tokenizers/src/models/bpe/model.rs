@@ -401,13 +401,17 @@ impl BPE {
 
             // Add the `continuing_subword_prefix` if relevant
             if !is_first {
-                if let Some(ref prefix) = self.continuing_subword_prefix {
+                if let Some(prefix) = self
+                    .continuing_subword_prefix
+                    .as_ref()
+                    .filter(|s| !s.is_empty())
+                {
                     s = format!("{prefix}{s}").into()
                 }
             }
             // Add the `end_of_word_suffix` if relevant
             if is_last {
-                if let Some(ref suffix) = self.end_of_word_suffix {
+                if let Some(suffix) = self.end_of_word_suffix.as_ref().filter(|s| !s.is_empty()) {
                     s = format!("{s}{suffix}").into()
                 }
             }
@@ -1309,5 +1313,71 @@ mod native_byte_tables_tests {
         let bpe = model(vec![("ñ".into(), "b".into())]);
         let rows = bpe.proved_byte_ranks(257, 2, 258, 1).unwrap().unwrap();
         assert_eq!(rows.last(), Some(&(vec![0xf1, b'b'], 1000)));
+    }
+
+    #[test]
+    fn empty_affixes_preserve_tokens_offsets_and_proof_limits() {
+        let plain = model(vec![("a".into(), "b".into())]);
+        let mut empty = plain.clone();
+        empty.continuing_subword_prefix = Some(String::new());
+        empty.end_of_word_suffix = Some(String::new());
+        for input in ["", "a", "ab", "aba", "é", "中", "a中b", "🦀"] {
+            assert_eq!(
+                plain.tokenize(input).unwrap(),
+                empty.tokenize(input).unwrap()
+            );
+            assert_eq!(
+                plain.tokenize_single_id(input).unwrap(),
+                empty.tokenize_single_id(input).unwrap()
+            );
+        }
+        for limits in [(257, 2, 258, 1), (256, 2, 258, 1), (257, 2, 258, 0)] {
+            assert_eq!(
+                plain
+                    .proved_byte_ranks(limits.0, limits.1, limits.2, limits.3)
+                    .unwrap(),
+                empty
+                    .proved_byte_ranks(limits.0, limits.1, limits.2, limits.3)
+                    .unwrap()
+            );
+        }
+        assert_eq!(empty.continuing_subword_prefix.as_deref(), Some(""));
+        assert_eq!(empty.end_of_word_suffix.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn empty_affixes_preserve_unknown_fusion_fallback_and_errors() {
+        for byte_fallback in [false, true] {
+            for fuse_unk in [false, true] {
+                for valid_unk in [false, true] {
+                    let mut vocab: Vocab =
+                        [("a".into(), 0), ("<0xC3>".into(), 1), ("<0xA9>".into(), 2)]
+                            .into_iter()
+                            .collect();
+                    if valid_unk {
+                        vocab.insert("[UNK]".into(), 3);
+                    }
+                    let plain = BPE::builder()
+                        .vocab_and_merges(vocab, vec![])
+                        .unk_token("[UNK]".into())
+                        .fuse_unk(fuse_unk)
+                        .byte_fallback(byte_fallback)
+                        .build()
+                        .unwrap();
+                    let mut empty = plain.clone();
+                    empty.continuing_subword_prefix = Some(String::new());
+                    empty.end_of_word_suffix = Some(String::new());
+                    for input in ["", "a", "é", "é中", "a中🦀a"] {
+                        match (plain.tokenize(input), empty.tokenize(input)) {
+                            (Ok(left), Ok(right)) => assert_eq!(left, right),
+                            (Err(left), Err(right)) => {
+                                assert_eq!(left.to_string(), right.to_string())
+                            }
+                            other => panic!("empty affixes changed tokenization: {other:?}"),
+                        }
+                    }
+                }
+            }
+        }
     }
 }
