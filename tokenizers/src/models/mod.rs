@@ -89,9 +89,21 @@ impl<'de> Deserialize<'de> for ModelWrapper {
             Unigram,
         }
 
+        // Decode WordLevel's map directly instead of building a sorted JSON
+        // Value vocabulary first. A different leading tag falls back before
+        // buffering its vocabulary again.
+        #[derive(Deserialize)]
+        pub struct DirectTagged {
+            #[serde(rename = "type")]
+            _kind: monostate::MustBe!("WordLevel"),
+            #[serde(flatten)]
+            model: WordLevel,
+        }
+
         #[derive(Deserialize)]
         #[serde(untagged)]
         pub enum ModelHelper {
+            Direct(DirectTagged),
             Tagged(Tagged),
             Legacy(serde_json::Value),
         }
@@ -109,6 +121,7 @@ impl<'de> Deserialize<'de> for ModelWrapper {
 
         let helper = ModelHelper::deserialize(deserializer)?;
         Ok(match helper {
+            ModelHelper::Direct(model) => ModelWrapper::WordLevel(model.model),
             ModelHelper::Tagged(model) => match model.variant {
                 EnumType::BPE => ModelWrapper::BPE(
                     serde_json::from_value(model.rest).map_err(serde::de::Error::custom)?,
