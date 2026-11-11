@@ -89,9 +89,25 @@ impl<'de> Deserialize<'de> for ModelWrapper {
             Unigram,
         }
 
+        // Preserve the original tagged decoder as the first path for the
+        // other models; they must not first attempt WordLevel's map decoder.
+        #[derive(Deserialize)]
+        pub struct OtherTagged {
+            #[serde(rename = "type")]
+            variant: OtherType,
+            #[serde(flatten)]
+            rest: serde_json::Value,
+        }
+        #[derive(Deserialize)]
+        pub enum OtherType {
+            BPE,
+            WordPiece,
+            Unigram,
+        }
+
         // Decode WordLevel's map directly instead of building a sorted JSON
-        // Value vocabulary first. A different leading tag falls back before
-        // buffering its vocabulary again.
+        // Value vocabulary first. Keep Tagged below as the error-compatible
+        // fallback for an explicitly tagged but invalid WordLevel model.
         #[derive(Deserialize)]
         pub struct DirectTagged {
             #[serde(rename = "type")]
@@ -103,6 +119,7 @@ impl<'de> Deserialize<'de> for ModelWrapper {
         #[derive(Deserialize)]
         #[serde(untagged)]
         pub enum ModelHelper {
+            Other(OtherTagged),
             Direct(DirectTagged),
             Tagged(Tagged),
             Legacy(serde_json::Value),
@@ -121,6 +138,17 @@ impl<'de> Deserialize<'de> for ModelWrapper {
 
         let helper = ModelHelper::deserialize(deserializer)?;
         Ok(match helper {
+            ModelHelper::Other(model) => match model.variant {
+                OtherType::BPE => ModelWrapper::BPE(
+                    serde_json::from_value(model.rest).map_err(serde::de::Error::custom)?,
+                ),
+                OtherType::WordPiece => ModelWrapper::WordPiece(
+                    serde_json::from_value(model.rest).map_err(serde::de::Error::custom)?,
+                ),
+                OtherType::Unigram => ModelWrapper::Unigram(
+                    serde_json::from_value(model.rest).map_err(serde::de::Error::custom)?,
+                ),
+            },
             ModelHelper::Direct(model) => ModelWrapper::WordLevel(model.model),
             ModelHelper::Tagged(model) => match model.variant {
                 EnumType::BPE => ModelWrapper::BPE(
