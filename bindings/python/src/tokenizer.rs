@@ -872,16 +872,16 @@ impl PyTokenizer {
     fn get_vocab_size(&self, with_added_tokens: bool) -> usize {
         if with_added_tokens {
             let model = self.tokenizer.get_model().model.read().unwrap();
-            if let ModelWrapper::BPE(bpe) = &*model {
-                // BPE stores a map of unique spellings. Other models can retain
-                // duplicate vocabulary entries, so keep their original path.
-                return bpe.get_vocab_size()
+            if matches!(&*model, ModelWrapper::BPE(_) | ModelWrapper::WordLevel(_)) {
+                // Both models store unique spellings in a map. Count only added
+                // spellings outside that map instead of copying the entire union.
+                return model.get_vocab_size()
                     + self
                         .tokenizer
                         .get_added_vocabulary()
                         .get_vocab()
                         .keys()
-                        .filter(|token| bpe.token_to_id(token).is_none())
+                        .filter(|token| model.token_to_id(token).is_none())
                         .count();
             }
         }
