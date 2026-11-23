@@ -540,6 +540,47 @@ impl PyBPE {
         PyBPE::with_builder(builder, kwargs)
     }
 
+    /// Build from merge pairs owned by a saved JSON loader.
+    #[classmethod]
+    #[pyo3(signature = (vocab, merges, **kwargs))]
+    fn _from_json_merge_pairs(
+        _cls: &Bound<'_, PyType>,
+        py: Python<'_>,
+        vocab: &Bound<'_, PyAny>,
+        merges: &Bound<'_, PyAny>,
+        kwargs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Option<Py<Self>>> {
+        let Ok(merges) = merges.cast_exact::<PyList>() else {
+            return Ok(None);
+        };
+        let mut pairs = Vec::with_capacity(merges.len());
+        for entry in merges.iter() {
+            let Ok(pair) = entry.cast_exact::<PyList>() else {
+                return Ok(None);
+            };
+            if pair.len() != 2 {
+                return Ok(None);
+            }
+            let Ok(left) = pair.get_item(0)?.extract::<String>() else {
+                return Ok(None);
+            };
+            let Ok(right) = pair.get_item(1)?.extract::<String>() else {
+                return Ok(None);
+            };
+            pairs.push((left, right));
+        }
+        let Ok(vocab) = vocab.extract::<HashMap<String, u32>>() else {
+            return Ok(None);
+        };
+        let model = Self::new(
+            py,
+            Some(PyVocab::Vocab(vocab)),
+            Some(PyMerges::Merges(pairs)),
+            kwargs,
+        )?;
+        Ok(Some(Py::new(py, model)?))
+    }
+
     /// Read a :obj:`vocab.json` and a :obj:`merges.txt` files
     ///
     /// This method provides a way to read and parse the content of these files,

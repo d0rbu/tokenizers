@@ -23,6 +23,20 @@ def model() -> BPE:
     return BPE({"a": 0, "b": 1, "ab": 2, "aba": 3, "ba": 4}, [("a", "b"), ("ab", "a")])
 
 
+def test_bpe_accepts_ordered_saved_merge_pairs():
+    vocab = {"a": 0, "b": 1, "ab": 2, "aba": 3}
+    pairs = [["a", "b"], ["ab", "a"]]
+    saved = BPE._from_json_merge_pairs(vocab, pairs)
+    legacy = BPE(vocab, [tuple(pair) for pair in pairs])
+    assert saved.__getstate__() == legacy.__getstate__()
+    assert [token.id for token in saved.tokenize("aba")] == [3]
+
+
+@pytest.mark.parametrize("pairs", [["a b"], [["a", "b"], "ab a"], [["a"]], [[0, "b"]]])
+def test_bpe_leaves_legacy_merge_shapes_to_the_caller(pairs):
+    assert BPE._from_json_merge_pairs({"a": 0, "b": 1, "ab": 2}, pairs) is None
+
+
 @pytest.mark.parametrize("quota", [0, 1, 2, 3, 4, 5, 9, 64_000_000])
 @pytest.mark.parametrize(
     "words",
