@@ -642,7 +642,6 @@ impl BPE {
         }
         alphabet.extend((256..hidden).map(|point| char::from_u32(point).unwrap()));
         let mut ordered = Vec::with_capacity(self.merges.len() + 256);
-        let mut words = AHashMap::<&str, u32>::with_capacity(self.merges.len() + 256);
         for character in alphabet {
             let mut buffer = [0u8; 4];
             let Some((&word, &id)) =
@@ -653,46 +652,59 @@ impl BPE {
             if id == u32::MAX {
                 return Ok(None);
             }
-            words.insert(word, id);
             ordered.push((word, id));
         }
         let mut merges = self.merges.iter().collect::<Vec<_>>();
         merges.sort_unstable_by_key(|(_, (rank, _))| *rank);
-        let mut total = 256usize;
-        let mut previous = 0u32;
-        let mut combined = String::new();
-        for (&(left_id, right_id), _) in merges {
-            let left = self.vocab_r[&left_id].as_str();
-            let right = self.vocab_r[&right_id].as_str();
-            let Some(size) = left.chars().count().checked_add(right.chars().count()) else {
-                return Ok(None);
-            };
-            let Some(next) = total.checked_add(size) else {
-                return Ok(None);
-            };
-            total = next;
-            if size > max_word_chars || total > max_total_chars {
-                return Ok(None);
+        let dense_total = if vocab.len() == self.vocab_r.len() {
+            self.extend_dense_proof_words(&mut ordered, &merges, max_word_chars, max_total_chars)
+        } else {
+            None
+        };
+        let total = if let Some(total) = dense_total {
+            total
+        } else {
+            ordered.truncate(256);
+            let mut words = AHashMap::<&str, u32>::with_capacity(self.merges.len() + 256);
+            words.extend(ordered.iter().copied());
+            let mut total = 256usize;
+            let mut previous = 0u32;
+            let mut combined = String::new();
+            for (&(left_id, right_id), _) in merges {
+                let left = self.vocab_r[&left_id].as_str();
+                let right = self.vocab_r[&right_id].as_str();
+                let Some(size) = left.chars().count().checked_add(right.chars().count()) else {
+                    return Ok(None);
+                };
+                let Some(next) = total.checked_add(size) else {
+                    return Ok(None);
+                };
+                total = next;
+                if size > max_word_chars || total > max_total_chars {
+                    return Ok(None);
+                }
+                let (Some(&left_rank), Some(&right_rank)) = (words.get(left), words.get(right))
+                else {
+                    return Ok(None);
+                };
+                combined.clear();
+                combined.push_str(left);
+                combined.push_str(right);
+                let Some((&word, &id)) = vocab.get_key_value(combined.as_str()) else {
+                    return Ok(None);
+                };
+                if id == u32::MAX
+                    || words.contains_key(word)
+                    || id <= previous.max(left_rank).max(right_rank)
+                {
+                    return Ok(None);
+                }
+                words.insert(word, id);
+                ordered.push((word, id));
+                previous = id;
             }
-            let (Some(&left_rank), Some(&right_rank)) = (words.get(left), words.get(right)) else {
-                return Ok(None);
-            };
-            combined.clear();
-            combined.push_str(left);
-            combined.push_str(right);
-            let Some((&word, &id)) = vocab.get_key_value(combined.as_str()) else {
-                return Ok(None);
-            };
-            if id == u32::MAX
-                || words.contains_key(word)
-                || id <= previous.max(left_rank).max(right_rank)
-            {
-                return Ok(None);
-            }
-            words.insert(word, id);
-            ordered.push((word, id));
-            previous = id;
-        }
+            total
+        };
         let mut scratch = Word::new();
         for &(word, expected) in &ordered {
             let length = word.chars().count();
@@ -708,6 +720,54 @@ impl BPE {
             }
         }
         Ok(Some(finish(ordered, decoder, total)))
+    }
+
+    /// Extend the byte alphabet by token ID when reverse vocabulary names are unique.
+    /// Any mismatch leaves the authoritative string-keyed proof available.
+    fn extend_dense_proof_words<'a>(
+        &'a self,
+        ordered: &mut Vec<(&'a str, u32)>,
+        merges: &[(&(u32, u32), &(u32, u32))],
+        max_word_chars: usize,
+        max_total_chars: usize,
+    ) -> Option<usize> {
+        let highest = *self.vocab_r.keys().max()? as usize;
+        if highest >= self.vocab_r.len().saturating_add(256) {
+            return None;
+        }
+        let mut table = vec![("", 0usize); highest + 1];
+        for (&id, word) in &self.vocab_r {
+            table[id as usize].0 = word;
+        }
+        for &(_, id) in ordered.iter() {
+            table[id as usize].1 = 1;
+        }
+
+        let mut total = 256usize;
+        let mut previous = 0u32;
+        for (&(left_id, right_id), &(_, id)) in merges.iter().copied() {
+            let &(left, left_len) = table.get(left_id as usize)?;
+            let &(right, right_len) = table.get(right_id as usize)?;
+            let (word, seen) = table.get_mut(id as usize)?;
+            if left_len == 0
+                || right_len == 0
+                || *seen != 0
+                || id == u32::MAX
+                || id <= previous.max(left_id).max(right_id)
+                || word.strip_prefix(left) != Some(right)
+            {
+                return None;
+            }
+            let size = left_len.checked_add(right_len)?;
+            total = total.checked_add(size)?;
+            if size > max_word_chars || total > max_total_chars {
+                return None;
+            }
+            *seen = size;
+            ordered.push((*word, id));
+            previous = id;
+        }
+        Some(total)
     }
 
     fn tokenize_with_cache(&self, sequence: &str) -> Result<Vec<Token>> {
@@ -1427,6 +1487,60 @@ mod native_byte_tables_tests {
             vocab.insert(format!("{a}{b}"), 1000 + index as u32);
         }
         BPE::new(vocab, merges)
+    }
+
+    #[test]
+    fn dense_proof_graph_matches_sparse_unicode_words_and_quotas() {
+        let merges = vec![
+            ("a".into(), "b".into()),
+            ("ab".into(), "ñ".into()),
+            ("ñ".into(), "z".into()),
+        ];
+        let sparse = model(merges.clone());
+        let compact = |id| if id < 1000 { id - 100 } else { id - 1000 + 256 };
+        let vocab = sparse
+            .vocab
+            .iter()
+            .map(|(word, &id)| (word.clone(), compact(id)))
+            .collect();
+        let dense = BPE::new(vocab, merges);
+        let mut base: Vec<_> = dense
+            .vocab_r
+            .iter()
+            .filter(|(id, _)| **id < 256)
+            .map(|(&id, word)| (word.as_str(), id))
+            .collect();
+        let mut edges: Vec<_> = dense.merges.iter().collect();
+        edges.sort_unstable_by_key(|(_, (rank, _))| *rank);
+        assert_eq!(base.len(), 256);
+        assert_eq!(
+            dense.extend_dense_proof_words(&mut base, &edges, 3, 263),
+            Some(263)
+        );
+        assert_eq!(&base[256..], &[("ab", 256), ("abñ", 257), ("ñz", 258)]);
+
+        for (entries, word_chars, total_chars, quota) in [
+            (259, 3, 263, 5),
+            (258, 3, 263, 5),
+            (259, 2, 263, 5),
+            (259, 3, 262, 5),
+            (259, 3, 263, 4),
+        ] {
+            let expected = sparse
+                .clone()
+                .proved_byte_ranks(entries, word_chars, total_chars, quota)
+                .unwrap()
+                .map(|rows| {
+                    rows.into_iter()
+                        .map(|(word, id)| (word, compact(id)))
+                        .collect()
+                });
+            let actual = dense
+                .clone()
+                .proved_byte_ranks(entries, word_chars, total_chars, quota)
+                .unwrap();
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]
