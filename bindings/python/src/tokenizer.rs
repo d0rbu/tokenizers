@@ -738,6 +738,36 @@ impl PyTokenizer {
         ToPyResult(self.tokenizer.to_string(pretty)).into()
     }
 
+    /// Copy the owned deterministic BPE backend without serializing its model.
+    fn _copy_owned_backend(&self) -> Option<Self> {
+        fn component<T: Serialize + serde::de::DeserializeOwned>(
+            source: Option<&T>,
+        ) -> Option<Option<T>> {
+            match source {
+                Some(value) => {
+                    let encoded = serde_json::to_value(value).ok()?;
+                    Some(Some(serde_json::from_value(encoded).ok()?))
+                }
+                None => Some(None),
+            }
+        }
+
+        let model = self.tokenizer.get_model().model.read().ok()?;
+        let ModelWrapper::BPE(model) = &*model else {
+            return None;
+        };
+        if model.dropout.unwrap_or(0.0) != 0.0 {
+            return None;
+        }
+        let mut result = self.clone();
+        result.tokenizer.with_model(model.clone());
+        result.tokenizer.with_normalizer(component(self.tokenizer.get_normalizer())?);
+        result.tokenizer.with_pre_tokenizer(component(self.tokenizer.get_pre_tokenizer())?);
+        result.tokenizer.with_post_processor(component(self.tokenizer.get_post_processor())?);
+        result.tokenizer.with_decoder(component(self.tokenizer.get_decoder())?);
+        Some(result)
+    }
+
     /// Retain the complete serializer's byte bound and failure behavior, while
     /// returning only the small metadata projection needed by native admission.
     fn _native_admission_metadata(&self, max_bytes: usize) -> PyResult<Option<String>> {
