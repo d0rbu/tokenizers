@@ -499,13 +499,14 @@ impl BPE {
     /// Return the sole ID, if any, with the same deterministic BPE/cache operations.
     /// This avoids materializing token strings and offsets for model proofs.
     pub fn tokenize_single_id(&self, sequence: &str) -> Result<Option<u32>> {
-        self.tokenize_single_id_with_buffer(sequence, &mut Word::new())
+        self.tokenize_single_id_with_buffer(sequence, &mut Word::new(), None)
     }
 
     fn tokenize_single_id_with_buffer(
         &self,
         sequence: &str,
         word: &mut Word,
+        initial_ranks: Option<&[u32; 324]>,
     ) -> Result<Option<u32>> {
         fn single_id(word: &Word) -> Option<u32> {
             let mut ids = word.get_chars_iter();
@@ -535,7 +536,16 @@ impl BPE {
         if let Some(ref hit) = self.cache.as_ref().and_then(|c| c.get(sequence)) {
             return Ok(single_id(hit));
         }
-        self.merge_word_into(sequence, true, word)?;
+        if let Some(ranks) = initial_ranks {
+            word.reset(sequence.len());
+            // The proof supplies only words assembled from this byte alphabet.
+            for scalar in sequence.chars() {
+                word.add(ranks[scalar as usize], scalar.len_utf8());
+            }
+            word.merge_all_for_proof(&self.merges);
+        } else {
+            self.merge_word_into(sequence, true, word)?;
+        }
         let result = single_id(word);
         if let Some(ref cache) = self.cache {
             if sequence.len() < MAX_LENGTH {
@@ -648,6 +658,10 @@ impl BPE {
         }
         alphabet.extend((256..hidden).map(|point| char::from_u32(point).unwrap()));
         let mut ordered = Vec::with_capacity(self.merges.len() + 256);
+        let use_initial_ranks = self.dropout.is_none()
+            && self.continuing_subword_prefix.as_deref().is_none_or(str::is_empty)
+            && self.end_of_word_suffix.as_deref().is_none_or(str::is_empty);
+        let mut initial_ranks = use_initial_ranks.then(|| [0u32; 324]);
         for character in alphabet {
             let mut buffer = [0u8; 4];
             let Some((&word, &id)) =
@@ -657,6 +671,13 @@ impl BPE {
             };
             if id == u32::MAX {
                 return Ok(None);
+            }
+            if let Some(ranks) = initial_ranks.as_mut() {
+                // The old proof resolves initial symbols against the forward map.
+                match self.vocab.get(word) {
+                    Some(&model_id) => ranks[character as usize] = model_id,
+                    None => initial_ranks = None,
+                }
             }
             ordered.push((word, id));
         }
@@ -721,7 +742,9 @@ impl BPE {
                 return Ok(None);
             };
             remaining = next;
-            if self.tokenize_single_id_with_buffer(word, &mut scratch)? != Some(expected) {
+            if self.tokenize_single_id_with_buffer(word, &mut scratch, initial_ranks.as_ref())?
+                != Some(expected)
+            {
                 return Ok(None);
             }
         }
@@ -983,7 +1006,7 @@ mod tests {
                             let expected = (tokens.len() == 1).then(|| tokens[0].id);
                             assert_eq!(
                                 actual
-                                    .tokenize_single_id_with_buffer(input, &mut scratch)
+                                    .tokenize_single_id_with_buffer(input, &mut scratch, None)
                                     .unwrap(),
                                 expected
                             );
@@ -1027,7 +1050,7 @@ mod tests {
                     let mut scratch = Word::new();
                     for input in ["a中", "a", "é", "", "é中🦀", "aaaa", "a"] {
                         let reference = bpe.tokenize(input);
-                        let actual = bpe.tokenize_single_id_with_buffer(input, &mut scratch);
+                        let actual = bpe.tokenize_single_id_with_buffer(input, &mut scratch, None);
                         match (reference, actual) {
                             (Ok(tokens), Ok(id)) => {
                                 assert_eq!(id, (tokens.len() == 1).then(|| tokens[0].id));
@@ -1622,6 +1645,24 @@ mod native_byte_tables_tests {
                 assert_eq!(packed, expected);
             }
         }
+    }
+
+    #[test]
+    fn packed_proof_keeps_the_missing_forward_symbol_error() {
+        let mut bpe = model(vec![("a".into(), "b".into())]);
+        bpe.vocab.remove("a");
+        bpe.unk_token = Some("missing".into());
+        let error = bpe
+            .clone()
+            .tokenize_single_id("a")
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            bpe.proved_packed_byte_ranks(1000, 4096, 1 << 20, 1 << 20)
+                .unwrap_err()
+                .to_string(),
+            error
+        );
     }
 
     #[test]
