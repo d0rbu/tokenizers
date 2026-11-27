@@ -821,26 +821,31 @@ impl PyTokenizer {
         max_word_chars: usize,
         max_total_bytes: usize,
     ) -> bool {
-        let vocab = self.tokenizer.get_vocab(true);
-        let mut seen = HashSet::with_capacity(vocab.len());
-        let mut total = 0usize;
-        for (word, id) in vocab {
-            if word.chars().count() > max_word_chars
-                || id == u32::MAX
-                || id >= max_entries
-                || !seen.insert(id)
-            {
-                return false;
-            }
-            let Some(next) = total.checked_add(word.len()) else {
-                return false;
-            };
-            total = next;
-            if total > max_total_bytes {
-                return false;
-            }
+        let model = self.tokenizer.get_model().model.read().unwrap();
+        if let ModelWrapper::BPE(bpe) = &*model {
+            let added = self.tokenizer.get_added_vocabulary().get_vocab();
+            // Added entries shadow matching model spellings, as in get_vocab(true).
+            let merged = bpe
+                .vocab_entries()
+                .filter(|(word, _)| !added.contains_key(*word))
+                .chain(added.iter().map(|(word, &id)| (word.as_str(), id)));
+            return bounded_vocab_rows(
+                merged,
+                bpe.get_vocab_size().saturating_add(added.len()),
+                max_entries,
+                max_word_chars,
+                max_total_bytes,
+            );
         }
-        true
+        drop(model);
+        let vocab = self.tokenizer.get_vocab(true);
+        bounded_vocab_rows(
+            vocab.iter().map(|(word, &id)| (word.as_str(), id)),
+            vocab.len(),
+            max_entries,
+            max_word_chars,
+            max_total_bytes,
+        )
     }
 
     /// Get the underlying vocabulary
@@ -1926,4 +1931,33 @@ mod test {
         let output = crate::utils::serde_pyo3::to_string(&tokenizer).unwrap();
         assert_eq!(output, "Tokenizer(version=\"1.0\", truncation=None, padding=None, added_tokens=[], normalizer=Sequence(normalizers=[NFKC(), Lowercase()]), pre_tokenizer=None, post_processor=None, decoder=None, model=BPE(dropout=None, unk_token=None, continuing_subword_prefix=None, end_of_word_suffix=None, fuse_unk=False, byte_fallback=False, ignore_merges=False, vocab={}, merges=[]))");
     }
+}
+
+
+fn bounded_vocab_rows<'a>(
+    rows: impl Iterator<Item = (&'a str, u32)>,
+    capacity: usize,
+    max_entries: u32,
+    max_word_chars: usize,
+    max_total_bytes: usize,
+) -> bool {
+    let mut seen = HashSet::with_capacity(capacity);
+    let mut total = 0usize;
+    for (word, id) in rows {
+        if word.chars().count() > max_word_chars
+            || id == u32::MAX
+            || id >= max_entries
+            || !seen.insert(id)
+        {
+            return false;
+        }
+        let Some(next) = total.checked_add(word.len()) else {
+            return false;
+        };
+        total = next;
+        if total > max_total_bytes {
+            return false;
+        }
+    }
+    true
 }

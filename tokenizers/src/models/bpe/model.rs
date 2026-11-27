@@ -367,6 +367,12 @@ impl BPE {
         }
     }
 
+    /// Borrow the owning BPE vocabulary during admission.
+    #[doc(hidden)]
+    pub fn vocab_entries(&self) -> impl Iterator<Item = (&str, u32)> {
+        self.vocab.iter().map(|(word, &id)| (word.as_str(), id))
+    }
+
     pub fn get_vocab(&self) -> HashMap<String, u32> {
         self.vocab.clone().into_iter().collect()
     }
